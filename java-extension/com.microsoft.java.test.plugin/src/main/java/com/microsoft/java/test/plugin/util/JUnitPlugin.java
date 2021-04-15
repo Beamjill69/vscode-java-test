@@ -88,4 +88,9 @@ public class JUnitPlugin implements BundleActivator {
                     .executeClientCommand("_java.test.askClientForChoice", placeHolder, choices, canPickMany);
     }
 
+    public static Object askClientForInput(String prompt, String defaultValue) {
+        return JavaLanguageServerPlugin.getInstance().getClientConnection()
+                    .executeClientCommand("_java.test.askClientForInput", prompt, defaultValue);
+    }
+
 }

@@ -16,12 +16,15 @@ import com.microsoft.java.test.plugin.provider.TestKindProvider;
 
 import org.eclipse.core.runtime.CoreException;
 import org.eclipse.core.runtime.IProgressMonitor;
+import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.jdt.core.IClasspathEntry;
 import org.eclipse.jdt.core.ICompilationUnit;
 import org.eclipse.jdt.core.IImportDeclaration;
 import org.eclipse.jdt.core.IJavaElement;
 import org.eclipse.jdt.core.IJavaProject;
 import org.eclipse.jdt.core.IMethod;
+import org.eclipse.jdt.core.IPackageFragment;
+import org.eclipse.jdt.core.IPackageFragmentRoot;
 import org.eclipse.jdt.core.IType;
 import org.eclipse.jdt.core.JavaModelException;
 import org.eclipse.jdt.core.dom.AST;
@@ -30,6 +33,7 @@ import org.eclipse.jdt.core.dom.AbstractTypeDeclaration;
 import org.eclipse.jdt.core.dom.Annotation;
 import org.eclipse.jdt.core.dom.Block;
 import org.eclipse.jdt.core.dom.CompilationUnit;
+import org.eclipse.jdt.core.dom.IMethodBinding;
 import org.eclipse.jdt.core.dom.ITypeBinding;
 import org.eclipse.jdt.core.dom.MethodDeclaration;
 import org.eclipse.jdt.core.dom.Modifier;
@@ -40,21 +44,29 @@ import org.eclipse.jdt.core.dom.rewrite.ASTRewrite;
 import org.eclipse.jdt.core.dom.rewrite.ImportRewrite;
 import org.eclipse.jdt.core.dom.rewrite.ImportRewrite.ImportRewriteContext;
 import org.eclipse.jdt.core.dom.rewrite.ListRewrite;
+import org.eclipse.jdt.core.formatter.CodeFormatter;
+import org.eclipse.jdt.core.refactoring.CompilationUnitChange;
 import org.eclipse.jdt.internal.core.manipulation.StubUtility;
 import org.eclipse.jdt.internal.corext.codemanipulation.ContextSensitiveImportRewriteContext;
 import org.eclipse.jdt.internal.corext.codemanipulation.StubUtility2Core;
 import org.eclipse.jdt.internal.corext.dom.ASTNodeFactory;
+import org.eclipse.jdt.internal.corext.refactoring.changes.CreateCompilationUnitChange;
+import org.eclipse.jdt.internal.corext.util.CodeFormatterUtil;
+import org.eclipse.jdt.ls.core.internal.ChangeUtil;
 import org.eclipse.jdt.ls.core.internal.JDTUtils;
 import org.eclipse.jdt.ls.core.internal.JavaLanguageServerPlugin;
 import org.eclipse.jdt.ls.core.internal.handlers.CodeGenerationUtils;
 import org.eclipse.jdt.ls.core.internal.text.correction.SourceAssistProcessor;
 import org.eclipse.lsp4j.MessageType;
 import org.eclipse.lsp4j.WorkspaceEdit;
+import org.eclipse.text.edits.InsertEdit;
 import org.eclipse.text.edits.MalformedTreeException;
 import org.eclipse.text.edits.MultiTextEdit;
 import org.eclipse.text.edits.TextEdit;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -139,7 +151,7 @@ public class TestGenerationUtils {
                 if (ProjectTestUtils.isTestEntry(entry)) {
                     return generateTestsFromTest(unit, root, (TypeDeclaration) coveringNode, binding, cursorPosition);
                 } else {
-                    generateTestsFromSource();
+                    return generateTestsFromSource(unit, binding, cursorPosition);
                 }
             }
         }
@@ -147,8 +159,32 @@ public class TestGenerationUtils {
         return null;
     }
 
-    private static void generateTestsFromSource() {
-        // TODO: unimplement
+    private static WorkspaceEdit generateTestsFromSource(ICompilationUnit unit, ITypeBinding typeBinding,
+            int cursorPosition) throws CoreException {
+        final List<TestKind> testFrameworksInProject = TestKindProvider.getTestKindsFromCache(unit.getJavaProject());
+        final TestKind testKind = determineTestFramework(new HashSet<>(testFrameworksInProject));
+        if (testKind == null) {
+            return null;
+        }
+
+        final IClasspathEntry testEntry = getTestClasspathEntry(unit);
+        final String testFullyQualifiedName = getTestFullyQualifiedName(typeBinding);
+        if (testFullyQualifiedName == null) {
+            return null;
+        }
+        final List<String> methodsToTest = getMethodsToTest(typeBinding);
+        if (methodsToTest == null || methodsToTest.size() == 0) {
+            return null;
+        }
+
+        final IPackageFragmentRoot packageRoot = unit.getJavaProject().findPackageFragmentRoot(testEntry.getPath());
+        final String packageQualifiedName = testFullyQualifiedName.substring(0,
+                testFullyQualifiedName.lastIndexOf("."));
+        final IPackageFragment packageFragment = packageRoot.getPackageFragment(packageQualifiedName);
+        final String compilationUnitName = testFullyQualifiedName.substring(
+                testFullyQualifiedName.lastIndexOf(".") + 1) + ".java";
+        final ICompilationUnit testUnit = packageFragment.getCompilationUnit(compilationUnitName);
+        return createTextEditFromSourceFile(testKind, testUnit, methodsToTest, cursorPosition);
     }
 
     private static WorkspaceEdit generateTestsFromTest(ICompilationUnit unit, CompilationUnit root,
@@ -243,14 +279,25 @@ public class TestGenerationUtils {
             annotationPrefix = TESTNG_LIFECYCLE_ANNOTATION_PREFIX;
         }
 
+        final String prefix = annotationPrefix;
+        final List<MethodMetaData> metadata = methodsToGenerate.stream().map(method -> {
+            final String annotationName = method.substring(1 /*1 for leading "@"*/, method.lastIndexOf(" "));
+            final String methodName = getPromptNameByAnnotation(annotationName);
+            return new MethodMetaData(methodName, prefix + annotationName);
+        }).collect(Collectors.toList());
+
+        return getTextEdit(kind, metadata, root, typeNode, typeBinding, insertPosition);
+    }
+
+    private static TextEdit getTextEdit(TestKind kind, List<MethodMetaData> methodMetadata, CompilationUnit root,
+            TypeDeclaration typeNode, ITypeBinding typeBinding, IJavaElement insertPosition)
+            throws JavaModelException, CoreException {
         final ASTRewrite astRewrite = ASTRewrite.create(root.getAST());
         final ImportRewrite importRewrite = StubUtility.createImportRewrite(root, true);
         final ListRewrite listRewrite = astRewrite.getListRewrite(typeNode,
                 ((AbstractTypeDeclaration) typeNode).getBodyDeclarationsProperty());
         final AST ast = astRewrite.getAST();
-        for (final String method : methodsToGenerate) {
-            final String annotationName = method.substring(1 /*1 for leading "@"*/, method.lastIndexOf(" "));
-            final String fullyQualifiedAnnotationName = annotationPrefix + annotationName;
+        for (final MethodMetaData method : methodMetadata) {
             
             final MethodDeclaration decl = ast.newMethodDeclaration();
             // JUnit 4's test method must be public
@@ -259,13 +306,13 @@ public class TestGenerationUtils {
             }
 
             // @BeforeClass and @AfterClass in JUnit 4 & 5 needs static modifier
-            if (needStaticModifier(kind, annotationName)) {
+            if (needStaticModifier(kind, method.annotation)) {
                 decl.modifiers().addAll(ASTNodeFactory.newModifiers(ast, Modifier.STATIC));
             }
 
             // set a unique method name according to the annotation type
             decl.setName(ast.newSimpleName(getUniqueMethodName(typeBinding.getJavaElement(),
-                    getPromptNameByAnnotation(annotationName))));
+                    method.methodName)));
             decl.setConstructor(false);
             decl.setReturnType2(ast.newPrimitiveType(PrimitiveType.VOID));
 
@@ -278,7 +325,7 @@ public class TestGenerationUtils {
             final Annotation marker = ast.newMarkerAnnotation();
             final ImportRewriteContext context = new ContextSensitiveImportRewriteContext(root,
                     decl.getStartPosition(), importRewrite);
-            marker.setTypeName(ast.newName(importRewrite.addImport(fullyQualifiedAnnotationName, context)));
+            marker.setTypeName(ast.newName(importRewrite.addImport(method.annotation, context)));
             astRewrite.getListRewrite(decl, MethodDeclaration.MODIFIERS2_PROPERTY).insertFirst(marker, null);
 
             final ASTNode insertion = StubUtility2Core.getNodeToInsertBefore(listRewrite, insertPosition);
@@ -293,6 +340,221 @@ public class TestGenerationUtils {
         edit.addChild(importRewrite.rewriteImports(null));
         edit.addChild(astRewrite.rewriteAST());
         return edit;
+    }
+
+    private static IClasspathEntry getTestClasspathEntry(ICompilationUnit unit) throws JavaModelException {
+        final IJavaProject javaProject = unit.getJavaProject();
+        // In most cases, this is the classpath entry used for testing, we first find the target entry by hard-code
+        // to avoid go into the generated entries.
+        final IClasspathEntry testEntry = javaProject.getClasspathEntryFor(
+            javaProject.getPath().append("src/test/java"));
+        if (ProjectTestUtils.isTestEntry(testEntry)) {
+            return testEntry;
+        }
+
+        final IClasspathEntry[] entries = javaProject.readRawClasspath();
+        for (final IClasspathEntry entry : entries) {
+            if (ProjectTestUtils.isTestEntry(entry)) {
+                return entry;
+            }
+        }
+
+        return entries[0];
+    }
+
+    private static String getTestFullyQualifiedName(ITypeBinding typeBinding) throws JavaModelException {
+        // TODO: Check the existance of the case *Test/*Tests
+        final String fullyQualifiedName = (String) JUnitPlugin.askClientForInput(
+            "Please type the target test class name", typeBinding.getBinaryName() + "Tests");
+        if (fullyQualifiedName == null) {
+            return null;
+        }
+
+        if (fullyQualifiedName.charAt(fullyQualifiedName.length() - 1) == '.') {
+            JavaLanguageServerPlugin.getInstance().getClientConnection().showNotificationMessage(MessageType.Error,
+                    "Invalid Java class name: " + fullyQualifiedName);
+            return null;
+        }
+
+        final String[] identifiers = fullyQualifiedName.split("\\.");
+        for (final String identifier : identifiers) {
+            final char[] chars = identifier.toCharArray();
+            if (!Character.isJavaIdentifierStart(chars[0])) {
+                JavaLanguageServerPlugin.getInstance().getClientConnection().showNotificationMessage(MessageType.Error,
+                    "Invalid Java identifier: " + identifier);
+                return null;
+            }
+            for (int i = 1; i < chars.length; i++) {
+                if (!Character.isJavaIdentifierPart(chars[i])) {
+                    JavaLanguageServerPlugin.getInstance().getClientConnection().showNotificationMessage(
+                        MessageType.Error, "Invalid Java identifier: " + identifier);
+                    return null;
+                }
+            }
+        }
+
+        return fullyQualifiedName;
+    }
+
+    private static List<String> getMethodsToTest(ITypeBinding typeBinding) {
+        final List<IMethodBinding> allMethods = new LinkedList<>();
+        final IMethodBinding[] typeMethods = typeBinding.getDeclaredMethods();
+        for (final IMethodBinding method : typeMethods) {
+            final int modifiers = method.getModifiers();
+            if (!method.isConstructor() && !Modifier.isPrivate(modifiers) && !method.isSynthetic()) {
+                allMethods.add(method);
+            }
+        }
+
+        ITypeBinding clazz = typeBinding.getSuperclass();
+        while (clazz != null && !"java.lang.Object".equals(clazz.getBinaryName())) {
+            for (final IMethodBinding method : clazz.getDeclaredMethods()) {
+                final int modifiers = method.getModifiers();
+                if (!method.isConstructor() && !Modifier.isPrivate(modifiers) && !method.isSynthetic()) {
+                    allMethods.add(method);
+                }
+            }
+            clazz = clazz.getSuperclass();
+        }
+
+        final Set<String> methodNames = allMethods.stream()
+            .map(method -> {
+                final String returnValue = method.getReturnType().getName();
+                final ITypeBinding[] paramTypes = method.getParameterTypes();
+                final String params = String.join(", ",
+                        Arrays.stream(paramTypes).map(t -> t.getName()).toArray(String[]::new));
+                
+                return returnValue + " " + method.getName() + "(" + params + ")";
+            })
+            .collect(Collectors.toSet());
+
+        return (List<String>) JUnitPlugin.askClientForChoice("Select the methods to test",
+                new ArrayList<>(methodNames), true /*pickMany*/);
+    }
+
+    private static WorkspaceEdit createTextEditFromSourceFile(TestKind kind, ICompilationUnit testUnit,
+            List<String> methodsToTest, int cursorPosition) throws CoreException {
+        if (testUnit.exists()) {
+            final IType[] types = testUnit.getAllTypes();
+            if (types.length == 0) {
+                // an empty java file
+                final CompilationUnitChange cuChange = new CompilationUnitChange("", testUnit);
+                final String cuContent = constructNewCU(testUnit, methodsToTest, kind);
+                cuChange.setEdit(new InsertEdit(0, cuContent));
+                return ChangeUtil.convertToWorkspaceEdit(cuChange);
+            }
+            final CompilationUnit root = (CompilationUnit) TestSearchUtils.parseToAst(testUnit,
+                false /* fromCache */, new NullProgressMonitor());
+
+            if (root == null) {
+                return null;
+            }
+
+            IType type = testUnit.findPrimaryType();
+            if (type == null) {
+                type = types[0];
+            }
+
+            final ASTNode typeNode = root.findDeclaringNode(type.getKey());
+            if (!(typeNode instanceof TypeDeclaration)) {
+                return null;
+            }
+
+            final ITypeBinding binding = ((TypeDeclaration) typeNode).resolveBinding();
+            if (binding == null) {
+                return null;
+            }
+
+            IJavaElement insertPosition = null; // Insert to the last by default.
+            try {
+                insertPosition = CodeGenerationUtils.findInsertElement(type, cursorPosition);
+            } catch (Throwable e) {
+                // ignore if the upstream does not support insert position preference.
+            }
+
+            return createTextEditFromSourceFile(root, kind, methodsToTest, (TypeDeclaration) typeNode,
+                    binding, insertPosition);
+        } else {
+            final String cuContent = constructNewCU(testUnit, methodsToTest, kind);
+            final CreateCompilationUnitChange change =
+                    new CreateCompilationUnitChange(testUnit, cuContent, "");
+            return ChangeUtil.convertToWorkspaceEdit(change);
+        }
+    }
+
+    private static WorkspaceEdit createTextEditFromSourceFile(CompilationUnit testRoot, TestKind kind,
+            List<String> methodsToTest, TypeDeclaration typeNode, ITypeBinding typeBinding,
+            IJavaElement insertPosition) throws JavaModelException, CoreException {
+        final String testAnnotation = getTestAnnotation(kind);
+        final List<MethodMetaData> metadata = methodsToTest.stream().map(method -> {
+            final String methodName = getTestMethodName(method);
+            return new MethodMetaData(methodName, testAnnotation);
+        }).collect(Collectors.toList());
+
+        final TextEdit edit = getTextEdit(kind, metadata, testRoot, typeNode, typeBinding, insertPosition);
+        return SourceAssistProcessor.convertToWorkspaceEdit((ICompilationUnit) testRoot.getJavaElement(), edit);
+    }
+
+    private static String constructNewCU(ICompilationUnit testUnit,
+            List<String> methods, TestKind testKind) throws CoreException {
+        final String delimiter = StubUtility.getLineDelimiterUsed(testUnit);
+        final String typeStub = constructTypeStub(testUnit, methods, testKind, delimiter);
+        final String cuContent = constructCUContent(testUnit, testKind, typeStub, delimiter);
+        final String formattedCuStub = CodeFormatterUtil.format(
+                CodeFormatter.K_COMPILATION_UNIT, cuContent, 0, delimiter, testUnit.getJavaProject().getOptions(true));
+        return formattedCuStub;
+    }
+
+    private static String constructCUContent(ICompilationUnit testUnit, TestKind testKind, 
+            String typeContent, String delimiter) throws CoreException {
+        final IPackageFragment packageFragment = (IPackageFragment) testUnit.getParent();
+        final StringBuilder buf = new StringBuilder();
+        if (!packageFragment.isDefaultPackage()) {
+            buf.append("package ")
+                .append(packageFragment.getElementName())
+                .append(";")
+                .append(delimiter)
+                .append(delimiter)
+                .append("import ")
+                .append(getTestAnnotation(testKind))
+                .append(";")
+                .append(delimiter)
+                .append(delimiter);
+        }
+        buf.append(typeContent);
+        return buf.toString();
+    }
+
+    private static String constructTypeStub(ICompilationUnit testUnit, List<String> methods,
+            TestKind testKind, String delimiter) throws CoreException {
+        final String typeName = testUnit.getElementName().replace(".java", "");
+        final StringBuilder buf = new StringBuilder();
+        buf.append("public class ").append(typeName).append(" {").append(delimiter);
+        for (final String method : methods) {
+            buf.append(constructMethodStub(testUnit, testKind, method, delimiter)).append(delimiter);
+        }
+        buf.append("}").append(delimiter);
+        return buf.toString();
+    }
+
+    private static String constructMethodStub(ICompilationUnit testUnit, TestKind testKind,
+            String method, String delimiter) {
+        final StringBuilder buf = new StringBuilder();
+        buf.append("@Test").append(delimiter);
+        if (testKind == TestKind.JUnit) {
+            buf.append("public ");
+        }
+        final String methodName = getTestMethodName(method);
+        buf.append("void ").append(methodName).append("() {").append(delimiter).append(delimiter).append("}");
+        final String methodContent = buf.toString();
+        return CodeFormatterUtil.format(CodeFormatter.K_STATEMENTS, methodContent, 1,
+                delimiter, testUnit.getJavaProject().getOptions(true));
+    }
+
+    private static String getTestMethodName(String focalMethodName) {
+        final String methodName = focalMethodName.substring(focalMethodName.indexOf(" ") + 1,
+                focalMethodName.indexOf("("));
+        return "test" + Character.toUpperCase(methodName.charAt(0)) + methodName.substring(1);
     }
 
     private static List<String> getLifecycleAnnotations(TestKind testKind) {
@@ -352,6 +614,9 @@ public class TestGenerationUtils {
             return false;
         }
 
+        annotation = annotation.substring(annotation.lastIndexOf(".") + 1);
+
+
         if (kind == TestKind.TestNG) {
             return false;
         }
@@ -379,6 +644,16 @@ public class TestGenerationUtils {
         return false;
     }
 
+    private static String getTestAnnotation(TestKind testKind) {
+        if (testKind == TestKind.JUnit) {
+            return "org.junit.Test";
+        } else if (testKind == TestKind.TestNG) {
+            return "org.testng.annotations.Test";
+        }
+
+        return "org.junit.jupiter.api.Test";
+    }
+
     private static String getUniqueMethodName(IJavaElement type, String suggestedName) throws JavaModelException {
         if (type instanceof IType) {
             final IMethod[] methods = ((IType) type).getMethods();
@@ -403,5 +678,15 @@ public class TestGenerationUtils {
             }
         }
         return false;
+    }
+
+    static class MethodMetaData {
+        public String methodName;
+        public String annotation;
+
+        public MethodMetaData(String methodName, String annotation) {
+            this.methodName = methodName;
+            this.annotation = annotation;
+        }
     }
 }
