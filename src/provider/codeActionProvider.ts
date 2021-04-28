@@ -34,10 +34,11 @@ export async function registerTestCodeActionProvider(): Promise<Disposable> {
     if (provider) {
         provider.dispose();
     }
-    const patterns: RelativePattern[] = await testSourceProvider.getTestSourcePattern(false /*containsGeneralProject*/);
-    const documentSelector: DocumentSelector = parseDocumentSelector(patterns);
+    // const patterns: RelativePattern[] = await testSourceProvider.getTestSourcePattern(false /*containsGeneralProject*/);
+    // const documentSelector: DocumentSelector = parseDocumentSelector(patterns);
     provider = languages.registerCodeActionsProvider(
-        documentSelector,
+        // documentSelector,
+        {language: 'java', scheme: 'file', pattern: '**/*.java'},
         new TestCodeActionProvider(),
         { providedCodeActionKinds: [CodeActionKind.Source.append('generate.tests')] },
     );
